@@ -1,14 +1,29 @@
 /// Originally based on https://github.com/unixpickle/SynthClone/blob/dc661c2367c03c775a931f7376b27ee45bd233bb/Sources/SynthClone/Transformer.swift
 
 import Foundation
+import HCBacktrace
 import Honeycrisp
 
 public struct TransformerConfig: Codable {
-  let vocabSize: Int
-  let tokenCount: Int
-  let layerCount: Int
-  let modelDim: Int
-  let headDim: Int
+  public let vocabSize: Int
+  public let tokenCount: Int
+  public let layerCount: Int
+  public let modelDim: Int
+  public let headDim: Int
+
+  public init(
+    vocabSize: Int,
+    tokenCount: Int,
+    layerCount: Int,
+    modelDim: Int,
+    headDim: Int
+  ) {
+    self.vocabSize = vocabSize
+    self.tokenCount = tokenCount
+    self.layerCount = layerCount
+    self.modelDim = modelDim
+    self.headDim = headDim
+  }
 }
 
 public class RoPE {
@@ -22,7 +37,8 @@ public class RoPE {
     cache = Tensor(stack: [args.cos(), args.sin()], axis: -1)
   }
 
-  func callAsFunction(_ x: Tensor, offset: Int = 0) -> Tensor {
+  @recordCaller
+  private func _callAsFunction(_ x: Tensor, offset: Int = 0) -> Tensor {
     assert(x.shape.count == 4, "expected [B x H x T x C]")
 
     let cache = self.cache[offset..<(x.shape[2] + offset)]
@@ -91,7 +107,8 @@ public class Attention: Trainable {
       inCount: config.modelDim, outCount: config.modelDim, bias: false)
   }
 
-  func callAsFunction(_ x: Tensor, kvCache: KVCache.Layer? = nil) -> Tensor {
+  @recordCaller
+  private func _callAsFunction(_ x: Tensor, kvCache: KVCache.Layer? = nil) -> Tensor {
     // Go from [B x T x C] -> [B x H x T x C/H]
     func moveHeadsToOuter(_ x: Tensor) -> Tensor {
       x.reshape([x.shape[0], x.shape[1], config.modelDim / config.headDim, config.headDim])[
@@ -148,7 +165,7 @@ public class Block: Trainable {
   @Child var lin1: Linear
   @Child var lin2: Linear
 
-  init(config: TransformerConfig) {
+  public init(config: TransformerConfig) {
     self.config = config
     super.init()
     self.attn = Attention(config: config)
@@ -160,7 +177,8 @@ public class Block: Trainable {
       inCount: config.modelDim * 2, outCount: config.modelDim, bias: false)
   }
 
-  func callAsFunction(_ x: Tensor, kvCache: KVCache.Layer? = nil) -> Tensor {
+  @recordCaller
+  private func _callAsFunction(_ x: Tensor, kvCache: KVCache.Layer? = nil) -> Tensor {
     var h = x
     h = h + attn(norm1(h), kvCache: kvCache)
     h = h + lin2(lin1(norm2(h)).gelu())
@@ -169,14 +187,14 @@ public class Block: Trainable {
 }
 
 public class Transformer: Trainable {
-  let config: TransformerConfig
+  public let config: TransformerConfig
 
   @Param var embed: Tensor
   @Child var layers: TrainableArray<Block>
   @Child var normOut: LayerNorm
   @Child var unembed: Linear
 
-  init(config: TransformerConfig) {
+  public init(config: TransformerConfig) {
     self.config = config
     super.init()
     embed = Tensor(randn: [config.vocabSize, config.modelDim])
@@ -190,7 +208,8 @@ public class Transformer: Trainable {
     unembed.weight = unembed.weight.noGrad() * 0
   }
 
-  func callAsFunction(_ x: Tensor, kvCache: KVCache? = nil) -> Tensor {
+  @recordCaller
+  private func _callAsFunction(_ x: Tensor, kvCache: KVCache? = nil) -> Tensor {
     // Input should be a [N x T] tensor of indices
     var h = embed.gather(axis: 0, indices: x.flatten()).reshape([
       x.shape[0], x.shape[1], config.modelDim,

@@ -12,13 +12,15 @@ import Palindrone
     let step: Int?
     let opt: Adam.State?
     let clipper: GradClipper.State?
-    // TODO: dataset state here.
+    let data: Dataset.State
   }
 
   // Dataset configuration
   @Option(name: .long, help: "Dataset directory.") var datasetDir: String
   @Option(name: .long, help: "Batch size.") var batchSize: Int = 8
   @Option(name: .long, help: "Divide batches into microbatches.") var microbatch: Int? = nil
+  @Option(name: .long, help: "Minimum length of context.") var minChunkLength: Int = 8
+  @Option(name: .long, help: "Maximum length of context.") var maxChunkLength: Int = 63
 
   // Model hyperparameters
   @Option(name: .long, help: "Transformer layers.") var depth: Int = 12
@@ -34,13 +36,74 @@ import Palindrone
   @Option(name: .shortAndLong, help: "Path to save state.") var savePath: String = "state.plist"
   @Option(name: .long, help: "Steps between saves.") var saveInterval: Int = 100
 
+  var tokenizer: Tokenizer {
+    Tokenizer(maxBytes: maxChunkLength)
+  }
+
   mutating func run() async {
     print("Command:", CommandLine.arguments.joined(separator: " "))
 
     do {
       Backend.defaultBackend = try MPSBackend(allocator: .bucket)
-      // TODO: train here.
+
+      print("creating dataset...")
+      let dataset = try Dataset(
+        directory: datasetDir, minChunkLength: minChunkLength, maxChunkLength: maxChunkLength)
+      let config = TransformerConfig(
+        vocabSize: tokenizer.vocabSize,
+        tokenCount: tokenizer.inputCount,
+        layerCount: depth,
+        modelDim: width,
+        headDim: 64
+      )
+
+      print("creating model...")
+      let model = Transformer(config: config)
+
+      var step: Int = 0
+      while true {
+        let batch = try await loadBatch(dataset: dataset)
+        let bs = batch.inputs.shape[0]
+        let microbatch = microbatch ?? bs
+        var totalLoss: Float = 0
+        for i in stride(from: 0, to: bs, by: microbatch) {
+          let microBs = min(microbatch, bs - i)
+          let outputs = model(batch.inputs[i..<(i + microBs)])
+          let losses = outputs.logSoftmax(axis: -1).gather(
+            axis: -1,
+            indices: batch.targets[i..<(i + microBs), ..., NewAxis()]
+          )
+          let loss = batch.masks[i..<(i + microBs)].when(isTrue: losses, isFalse: 0).sum()
+          loss.backward()
+          totalLoss += try await loss.item()
+        }
+        let normalizer = 1.0 / (try await batch.masks.cast(.float32).sum().item())
+        let meanLoss = totalLoss * normalizer
+        for (_, var p) in model.parameters {
+          p.grad! = p.grad! * normalizer
+        }
+        print("step \(step): loss=\(meanLoss)")
+        step += 1
+      }
+
     } catch { print("FATAL ERROR: \(error)") }
+  }
+
+  func loadBatch(dataset: Dataset) async throws -> (inputs: Tensor, targets: Tensor, masks: Tensor)
+  {
+    var inputs = [Tensor]()
+    var targets = [Tensor]()
+    var masks = [Tensor]()
+    for _ in 0..<batchSize {
+      let sequence = try await dataset.next()
+      let (input, target, mask) = tokenizer.tokenize(sequence: sequence)
+      inputs.append(input)
+      targets.append(target)
+      masks.append(mask)
+    }
+    return (
+      inputs: Tensor(stack: inputs), targets: Tensor(stack: targets), masks: Tensor(stack: masks)
+    )
   }
 
 }
