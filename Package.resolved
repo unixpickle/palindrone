@@ -1,5 +1,5 @@
 {
-  "originHash" : "a3b109a79c0bd6b5479c81bb7c7d3ccdfc6f94b57c49c130c28ea30dd7749606",
+  "originHash" : "88b927f8df03e08910e77c960df805b2c6d0cfaf35c0ff5b01f2a103a5ac47df",
   "pins" : [
     {
       "identity" : "coreml-builder",
@@ -24,8 +24,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/unixpickle/honeycrisp",
       "state" : {
-        "revision" : "65e5a8fc94d4eff1138271e26ee4edba372eaae7",
-        "version" : "0.0.30"
+        "revision" : "b20495907d3ddf9e7900a88dc8c9c8e0e4e198ab",
+        "version" : "0.0.31"
       }
     },
     {

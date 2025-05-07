@@ -12,7 +12,7 @@ import Palindrone
     let step: Int?
     let opt: Adam.State?
     let clipper: GradClipper.State?
-    let data: Dataset.State
+    let data: Dataset.State?
   }
 
   // Dataset configuration
@@ -48,19 +48,50 @@ import Palindrone
 
       print("creating dataset...")
       let dataset = try Dataset(
-        directory: datasetDir, minChunkLength: minChunkLength, maxChunkLength: maxChunkLength)
-      let config = TransformerConfig(
-        vocabSize: tokenizer.vocabSize,
-        tokenCount: tokenizer.inputCount,
-        layerCount: depth,
-        modelDim: width,
-        headDim: 64
+        directory: datasetDir,
+        minChunkLength: minChunkLength,
+        maxChunkLength: maxChunkLength
       )
 
-      print("creating model...")
-      let model = Transformer(config: config)
+      var model: Transformer
+      var opt: Adam
+      let clipper = GradClipper()
 
       var step: Int = 0
+
+      if FileManager.default.fileExists(atPath: savePath) {
+        print("loading from checkpoint: \(savePath) ...")
+        let data = try Data(contentsOf: URL(fileURLWithPath: savePath))
+        let decoder = PropertyListDecoder()
+        let state = try decoder.decode(State.self, from: data)
+
+        print("creating model...")
+        model = Transformer(config: state.modelConfig)
+        try model.loadState(state.model)
+
+        print("creating optimizer...")
+        opt = Adam(model.parameters, lr: lr)
+        if let optState = state.opt { try opt.loadState(optState) }
+
+        if let clipperState = state.clipper { clipper.state = clipperState }
+        if let dataState = state.data { dataset.state = dataState }
+        step = state.step ?? 0
+      } else {
+        print("creating model...")
+        model = Transformer(
+          config: TransformerConfig(
+            vocabSize: tokenizer.vocabSize,
+            tokenCount: tokenizer.inputCount,
+            layerCount: depth,
+            modelDim: width,
+            headDim: 64
+          )
+        )
+
+        print("creating optimizer...")
+        opt = Adam(model.parameters, lr: lr)
+      }
+
       while true {
         let batch = try await loadBatch(dataset: dataset)
         let bs = batch.inputs.shape[0]
@@ -82,8 +113,23 @@ import Palindrone
         for (_, var p) in model.parameters {
           p.grad! = p.grad! * normalizer
         }
-        print("step \(step): loss=\(meanLoss)")
+        let (norm, _) = try await clipper.clipGrads(model: model)
+        opt.step()
+        opt.clearGrads()
+        print("step \(step): loss=\(meanLoss) grad_norm=\(norm)")
         step += 1
+        if step % saveInterval == 0 {
+          let state = State(
+            modelConfig: model.config,
+            model: try await model.state(),
+            step: step,
+            opt: try await opt.state(),
+            clipper: clipper.state,
+            data: dataset.state
+          )
+          let stateData = try PropertyListEncoder().encode(state)
+          try stateData.write(to: URL(filePath: savePath), options: .atomic)
+        }
       }
 
     } catch { print("FATAL ERROR: \(error)") }
