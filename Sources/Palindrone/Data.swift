@@ -46,7 +46,7 @@ public class Dataset {
     textFilenames =
       files
       .filter { $0.pathExtension == "txt" }
-      .map { $0.deletingPathExtension().lastPathComponent }
+      .map { $0.lastPathComponent }
       .sorted()
   }
 
@@ -133,10 +133,10 @@ public class Dataset {
     if let result = allWords {
       return result
     }
-    let fileURL = URL(filePath: directory)
-    let allURLs = textFilenames.map { fileURL.appending(component: $0) }
-    allWords = try allURLs.map { url in
-      try String(contentsOf: url, encoding: .utf8)
+    let fileURL = URL(filePath: directory).absoluteURL
+    let allURLs = textFilenames.map { fileURL.appending(path: $0) }
+    allWords = allURLs.map { url in
+      (try? String(contentsOf: url, encoding: .utf8)) ?? ""
     }.joined(separator: "\n").lowercased().components(separatedBy: .whitespacesAndNewlines)
       .compactMap { word in
         let result = word.compactMap { char -> UInt8? in

@@ -103,8 +103,8 @@ import Palindrone
           let losses = outputs.logSoftmax(axis: -1).gather(
             axis: -1,
             indices: batch.targets[i..<(i + microBs), ..., NewAxis()]
-          )
-          let loss = batch.masks[i..<(i + microBs)].when(isTrue: losses, isFalse: 0).sum()
+          ).squeeze(axis: -1)
+          let loss = -batch.masks[i..<(i + microBs)].when(isTrue: losses, isFalse: 0).sum()
           loss.backward()
           totalLoss += try await loss.item()
         }
