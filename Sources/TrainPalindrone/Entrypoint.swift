@@ -17,7 +17,7 @@ import Palindrone
 
   // Dataset configuration
   @Option(name: .long, help: "Dataset directory.") var datasetDir: String
-  @Option(name: .long, help: "Batch size.") var batchSize: Int = 8
+  @Option(name: .long, help: "Batch size.") var batchSize: Int = 64
   @Option(name: .long, help: "Divide batches into microbatches.") var microbatch: Int? = nil
   @Option(name: .long, help: "Minimum length of context.") var minChunkLength: Int = 8
   @Option(name: .long, help: "Maximum length of context.") var maxChunkLength: Int = 63

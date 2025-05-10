@@ -229,6 +229,40 @@ public class Transformer: Trainable {
     return h
   }
 
+  @recordCaller
+  private func _sampleStream(
+    prefixes: Tensor, generator: RandomGenerator? = nil
+  )
+    -> AsyncStream<Tensor>
+  {
+    #alwaysAssert(prefixes.shape.count == 2, "\(prefixes.shape)")
+    #alwaysAssert(prefixes.shape[1] >= 1, "\(prefixes.shape)")
+    let kvCache = KVCache(batchSize: prefixes.shape[0], config: config)
+    let config = config
+    return AsyncStream { continuation in
+      var prevToken = prefixes
+      for _ in 0..<(config.tokenCount - prefixes.shape[1]) {
+        if Task.isCancelled {
+          return
+        }
+        let logits = Tensor.withGrad(enabled: false) {
+          // Without asDependency, we may allocate fp16 parameters many
+          // times at once since the internal cast() in the model doesn't
+          // depend on any other result tensors.
+          prevToken.asDependency {
+            self(prevToken, kvCache: kvCache)[..., -1]
+          }
+        }
+
+        let gumbels = -(-Tensor(randLike: logits, generator: generator).log()).log()
+        let samples = (logits + gumbels).argmax(axis: -1).unsqueeze(axis: 1)
+        prevToken = samples
+        continuation.yield(samples)
+      }
+      continuation.finish()
+    }
+  }
+
   func paramNorm() async throws -> Float {
     try await parameters.map { (_, param) in param.data!.pow(2).sum() }
       .reduce(

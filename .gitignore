@@ -2,3 +2,5 @@
 .DS_Store
 books/
 .vscode/
+state.plist
+Package.resolved
