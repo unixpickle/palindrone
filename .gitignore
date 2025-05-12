@@ -4,3 +4,5 @@ books/
 .vscode/
 state.plist
 Package.resolved
+data/wikipedia_texts/
+*.bz2

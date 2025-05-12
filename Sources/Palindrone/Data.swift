@@ -9,6 +9,7 @@ public class Dataset {
   }
 
   public enum DatasetError: Error {
+    case couldNotEnumerate
     case datasetIsEmpty
   }
 
@@ -41,12 +42,22 @@ public class Dataset {
     self.maxChunkLength = maxChunkLength
 
     let fileManager = FileManager.default
-    let files = try fileManager.contentsOfDirectory(
-      at: URL(filePath: directory), includingPropertiesForKeys: nil)
+    let baseURL = URL(filePath: directory).absoluteURL
+    guard
+      let enumerator = fileManager.enumerator(
+        at: baseURL,
+        includingPropertiesForKeys: nil,
+        options: [.skipsHiddenFiles, .skipsPackageDescendants]
+      )
+    else {
+      throw DatasetError.couldNotEnumerate
+    }
+
     textFilenames =
-      files
-      .filter { $0.pathExtension == "txt" }
-      .map { $0.lastPathComponent }
+      enumerator
+      .compactMap { $0 as? URL }
+      .filter { $0.pathExtension.lowercased() == "txt" }
+      .map { $0.path.replacingOccurrences(of: baseURL.path + "/", with: "") }
       .sorted()
   }
 
