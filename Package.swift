@@ -17,6 +17,7 @@ let package = Package(
     .target(
       name: "Palindrone",
       dependencies: [
+        .product(name: "ArgumentParser", package: "swift-argument-parser"),
         .product(name: "Honeycrisp", package: "honeycrisp"),
         .product(name: "HCBacktrace", package: "honeycrisp"),
       ]

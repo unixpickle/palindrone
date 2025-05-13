@@ -15,6 +15,10 @@ import Palindrone
   @Option(name: .long, help: "Minimum length of context.") var minChunkLength: Int = 8
   @Option(name: .long, help: "Maximum length of context.") var maxChunkLength: Int = 63
 
+  // Sampling parameters
+  @Option(name: .long, help: "Sampling algorithm.") var algorithm: SampleMethod = .greedy
+  @Option(name: .long, help: "If specified, force this sample length.") var length: Int? = nil
+
   // Saving
   @Option(name: .shortAndLong, help: "Path to save state.") var savePath: String = "state.plist"
 
@@ -37,26 +41,13 @@ import Palindrone
       let model = Transformer(config: state.modelConfig)
       try model.loadState(state.model)
 
-      var iterator = model.sampleStream(prefixes: Tensor(data: [0], shape: [1, 1]))
-        .makeAsyncIterator()
-      let charCount = try await iterator.next()!.ints()[0] - 256
-      print("character count: \(charCount)")
-      var allChars = [UInt8]()
-      for i in 0..<charCount {
-        let nextToken = try await iterator.next()!.ints()[0]
-        if let scalar = UnicodeScalar(nextToken), scalar.isASCII {
-          let asciiChar = Character(scalar)
-          print("character \(i): '\(asciiChar)'")
-        } else {
-          print("character \(i): \(nextToken)")
-        }
-        allChars.append(UInt8(nextToken))
-      }
-      let decoded = tokenizer.inverseAlternating(allChars)
-      if let string = String(bytes: decoded, encoding: .utf8) {
+      let sample = try await algorithm.sample(
+        model: model, tokenizer: tokenizer, charCount: length, verbose: true)
+
+      if let string = String(bytes: sample, encoding: .utf8) {
         print("Result: \(string)")
       } else {
-        print("Invalid UTF-8 sequence: \(decoded)")
+        print("Invalid UTF-8 sequence: \(sample)")
       }
 
     } catch { print("FATAL ERROR: \(error)") }
