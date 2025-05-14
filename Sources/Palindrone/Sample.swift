@@ -7,6 +7,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   case random
   case rejection
   case greedy
+  case bfs
 
   @recordCaller
   private func _sample(
@@ -21,6 +22,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
     case .greedy:
       try await greedySample(
+        model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
+    case .bfs:
+      try await bfsSample(
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
     }
   }
@@ -132,6 +136,51 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       }
     }
     return result + endResult.reversed()
+  }
+
+  @recordCaller
+  private func _bfsSample(
+    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
+  ) async throws -> [UInt8] {
+    let charCount =
+      if let cc = charCount {
+        cc
+      } else {
+        try await sampleCharCount(model: model, tokenizer: tokenizer)
+      }
+
+    struct SearchNode {
+      let prefix: [UInt8]
+      let nll: Float
+    }
+
+    var nodes = [SearchNode(prefix: [], nll: 0.0)]
+    while let nextNode = nodes.popLast() {
+      print("popping \(nextNode.prefix) with nll \(nextNode.nll)")
+      if nextNode.prefix.count == charCount {
+        return tokenizer.inverseAlternating(nextNode.prefix)
+      }
+      let logits = model(
+        Tensor(
+          data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
+          shape: [1, nextNode.prefix.count + 2]))
+      for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
+        if i >= 0x80 {
+          continue
+        }
+
+        // Enforce palindrome constraint.
+        if nextNode.prefix.count % 2 == 1 {
+          if i != Int(nextNode.prefix.last!) {
+            continue
+          }
+        }
+
+        nodes.append(SearchNode(prefix: nextNode.prefix + [UInt8(i)], nll: nextNode.nll - logProb))
+      }
+      nodes.sort { $0.nll > $1.nll }
+    }
+    return []
   }
 
   @recordCaller
