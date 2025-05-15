@@ -8,6 +8,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   case rejection
   case greedy
   case bfs
+  case bfsRandom
 
   @recordCaller
   private func _sample(
@@ -26,6 +27,10 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     case .bfs:
       try await bfsSample(
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
+    case .bfsRandom:
+      try await bfsSample(
+        model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose, stochastic: true
+      )
     }
   }
 
@@ -140,8 +145,17 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
 
   @recordCaller
   private func _bfsSample(
-    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
+    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
+    stochastic: Bool = false
   ) async throws -> [UInt8] {
+    func maybeAddNoise(_ x: Tensor) -> Tensor {
+      if stochastic {
+        x - (-(Tensor(randLike: x).clamp(min: 1e-5, max: 1 - 1e-5).log())).log()
+      } else {
+        x
+      }
+    }
+
     let charCount =
       if let cc = charCount {
         cc
@@ -156,27 +170,63 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
 
     var nodes = [SearchNode(prefix: [], nll: 0.0)]
     while let nextNode = nodes.popLast() {
-      print("popping \(nextNode.prefix) with nll \(nextNode.nll)")
       if nextNode.prefix.count == charCount {
         return tokenizer.inverseAlternating(nextNode.prefix)
       }
-      let logits = model(
-        Tensor(
-          data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
-          shape: [1, nextNode.prefix.count + 2]))
-      for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
-        if i >= 0x80 {
-          continue
-        }
 
-        // Enforce palindrome constraint.
-        if nextNode.prefix.count % 2 == 1 {
-          if i != Int(nextNode.prefix.last!) {
+      print("expanding node of length \(nextNode.prefix.count) with NLL \(nextNode.nll)")
+
+      if nextNode.prefix.count % 2 == 1 && nextNode.prefix.count + 1 < charCount {
+        // Lookahead to next token without an extra forward pass
+        let prev = Int(nextNode.prefix.last!)
+        let allLogits = maybeAddNoise(
+          model(
+            Tensor(
+              data: [0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev],
+              shape: [1, nextNode.prefix.count + 3]
+            )
+          )
+        )
+        let nextNLL = try await -allLogits[..., -2].logSoftmax().floats()[prev]
+        for (i, logProb) in try await allLogits[..., -1].logSoftmax().floats().enumerated() {
+          if i >= 0x80 {
             continue
           }
+          nodes.append(
+            SearchNode(
+              prefix: nextNode.prefix + [UInt8(prev), UInt8(i)],
+              nll: nextNode.nll + nextNLL - logProb
+            )
+          )
         }
+      } else {
+        let logits = maybeAddNoise(
+          model(
+            Tensor(
+              data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
+              shape: [1, nextNode.prefix.count + 2]
+            )
+          )
+        )[..., -1]
+        for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
+          if i >= 0x80 {
+            continue
+          }
 
-        nodes.append(SearchNode(prefix: nextNode.prefix + [UInt8(i)], nll: nextNode.nll - logProb))
+          // Enforce palindrome constraint.
+          if nextNode.prefix.count % 2 == 1 {
+            if i != Int(nextNode.prefix.last!) {
+              continue
+            }
+          }
+
+          nodes.append(
+            SearchNode(
+              prefix: nextNode.prefix + [UInt8(i)],
+              nll: nextNode.nll - logProb
+            )
+          )
+        }
       }
       nodes.sort { $0.nll > $1.nll }
     }
