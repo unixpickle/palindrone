@@ -35,6 +35,26 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   }
 
   @recordCaller
+  private func _sampleBatch(
+    model: Transformer, tokenizer: Tokenizer, batchSize: Int, charCount: Int, verbose: Bool = false
+  ) async throws -> [[UInt8]] {
+    switch self {
+    case .greedy:
+      return try await greedySampleBatch(
+        model: model, tokenizer: tokenizer, batchSize: batchSize, charCount: charCount,
+        verbose: verbose)
+    default:
+      var result = [[UInt8]]()
+      for _ in 0..<batchSize {
+        result.append(
+          try await sample(
+            model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose))
+      }
+      return result
+    }
+  }
+
+  @recordCaller
   private func _randomSample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
   ) async throws -> [UInt8] {
@@ -141,6 +161,42 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       }
     }
     return result + endResult.reversed()
+  }
+
+  @recordCaller
+  private func _greedySampleBatch(
+    model: Transformer, tokenizer: Tokenizer, batchSize: Int, charCount: Int, verbose: Bool = false
+  ) async throws -> [[UInt8]] {
+    let sampler = Sampler(
+      model: model, prefixes: Tensor(data: [0], shape: [1, 1]).repeating(axis: 0, count: batchSize))
+    try await sampler.predictNextLogits().wait()  // result is ignored
+    sampler.sampled(
+      tokens: Tensor(data: [charCount + 256], shape: [1, 1]).repeating(axis: 0, count: batchSize))
+    var result = [[UInt8]](repeating: [], count: batchSize)
+    var endResult = [[UInt8]](repeating: [], count: batchSize)
+    for i in stride(from: 0, to: charCount, by: 2) {
+      let firstSample = sampler.sampleTokens(logits: sampler.predictNextLogits())
+      sampler.sampled(tokens: firstSample)
+      for (j, token) in try await firstSample.ints().enumerated() {
+        result[j].append(UInt8(token))
+        if i + 1 < charCount {
+          endResult[j].append(UInt8(token))
+        }
+        if verbose {
+          if let scalar = UnicodeScalar(token), scalar.isASCII {
+            let asciiChar = Character(scalar)
+            print("sample \(j) character \(i): '\(asciiChar)'")
+          } else {
+            print("sample \(j) character \(i): \(token)")
+          }
+        }
+      }
+      if i + 1 < charCount {
+        let _ = sampler.predictNextLogits()  // We don't actually care about the logits
+        sampler.sampled(tokens: firstSample)
+      }
+    }
+    return zip(result, endResult).map { $0.0 + $0.1.reversed() }
   }
 
   @recordCaller

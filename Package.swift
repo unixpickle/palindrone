@@ -36,5 +36,12 @@ let package = Package(
         .product(name: "Honeycrisp", package: "honeycrisp"),
       ]
     ),
+    .executableTarget(
+      name: "SampleMany",
+      dependencies: [
+        "Palindrone", .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "Honeycrisp", package: "honeycrisp"),
+      ]
+    ),
   ]
 )
