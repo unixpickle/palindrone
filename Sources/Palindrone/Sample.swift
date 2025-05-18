@@ -177,7 +177,8 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     for i in stride(from: 0, to: charCount, by: 2) {
       let firstSample = sampler.sampleTokens(logits: sampler.predictNextLogits())
       sampler.sampled(tokens: firstSample)
-      for (j, token) in try await firstSample.ints().enumerated() {
+      for (j, t) in try await firstSample.ints().enumerated() {
+        let token = min(t, 0xff)
         result[j].append(UInt8(token))
         if i + 1 < charCount {
           endResult[j].append(UInt8(token))
