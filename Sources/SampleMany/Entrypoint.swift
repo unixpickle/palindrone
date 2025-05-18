@@ -51,17 +51,25 @@ import Palindrone
         )
         let inputSeqs = Tensor(
           data: batch.flatMap {
-            [0, length + 256] + tokenizer.alternatingStartEnd($0).map(Int.init)
+            [0, length + 256] + tokenizer.alternatingStartEnd($0.bytes).map(Int.init)
           },
           shape: [batchSize, length + 2])
         let preds = Tensor.withGrad(enabled: false) {
           model(inputSeqs)[..., 1..<(inputSeqs.shape[1] - 1)]
         }
-        let logLoss = try await preds.logSoftmax(axis: 1).gather(
+        var logProbs = try await preds.logSoftmax(axis: -1).gather(
           axis: -1, indices: inputSeqs[..., 2...].unsqueeze(axis: -1)
         ).squeeze(axis: -1).sum(axis: 1).floats()
-        allLogProbs.append(contentsOf: logLoss.map { $0 })
-        allSamples.append(contentsOf: batch)
+
+        // Importance sample, p(x) / p_sample(x)
+        for (i, x) in batch.enumerated() {
+          if let lp = x.logProb {
+            logProbs[i] -= lp
+          }
+        }
+
+        allLogProbs.append(contentsOf: logProbs)
+        allSamples.append(contentsOf: batch.map { $0.bytes })
 
         try await sampleAndPrint(allSamples, allLogProbs)
       }

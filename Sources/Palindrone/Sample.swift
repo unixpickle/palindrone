@@ -2,6 +2,11 @@ import ArgumentParser
 import HCBacktrace
 import Honeycrisp
 
+public struct Sample {
+  public let bytes: [UInt8]
+  public let logProb: Float?
+}
+
 public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable {
 
   case random
@@ -13,7 +18,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   @recordCaller
   private func _sample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
-  ) async throws -> [UInt8] {
+  ) async throws -> Sample {
     switch self {
     case .random:
       try await randomSample(
@@ -37,14 +42,14 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   @recordCaller
   private func _sampleBatch(
     model: Transformer, tokenizer: Tokenizer, batchSize: Int, charCount: Int, verbose: Bool = false
-  ) async throws -> [[UInt8]] {
+  ) async throws -> [Sample] {
     switch self {
     case .greedy:
       return try await greedySampleBatch(
         model: model, tokenizer: tokenizer, batchSize: batchSize, charCount: charCount,
         verbose: verbose)
     default:
-      var result = [[UInt8]]()
+      var result = [Sample]()
       for _ in 0..<batchSize {
         result.append(
           try await sample(
@@ -57,22 +62,27 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   @recordCaller
   private func _randomSample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
-  ) async throws -> [UInt8] {
+  ) async throws -> Sample {
+    var logProb: Float = 0.0
     let initialData =
       if let cc = charCount {
         [0, cc + 256]
       } else {
         [0]
       }
-    var iterator = Sampler(
+    let iterator = Sampler(
       model: model, prefixes: Tensor(data: initialData, shape: [1, initialData.count])
-    ).sampleStream().makeAsyncIterator()
+    ).iterate()
 
     let charCount =
       if let cc = charCount {
         cc
       } else {
-        try await iterator.next()!.ints()[0] - 256
+        try await {
+          let (output, lp) = iterator.next()!
+          logProb += try await lp.item()
+          return try await output.ints()[0] - 256
+        }()
       }
 
     if verbose {
@@ -80,7 +90,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     }
     var allChars = [UInt8]()
     for i in 0..<charCount {
-      let nextToken = try await iterator.next()!.ints()[0]
+      let (sample, lp) = iterator.next()!
+      logProb += try await lp.item()
+      let nextToken = try await sample.ints()[0]
       allChars.append(UInt8(nextToken))
       if verbose {
         if let scalar = UnicodeScalar(nextToken), scalar.isASCII {
@@ -91,19 +103,20 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         }
       }
     }
-    return tokenizer.inverseAlternating(allChars)
+    return Sample(bytes: tokenizer.inverseAlternating(allChars), logProb: logProb)
   }
 
   @recordCaller
   private func _rejectionSample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
-  ) async throws -> [UInt8] {
+  ) async throws -> Sample {
     let charCount =
       if let cc = charCount {
         cc
       } else {
-        try await sampleCharCount(model: model, tokenizer: tokenizer)
+        try await sampleCharCount(model: model, tokenizer: tokenizer).0
       }
+
     var attempt = 1
     while true {
       if verbose {
@@ -111,9 +124,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       }
       let sample = try await randomSample(
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
-      if sample.reversed() == sample {
+      if sample.bytes.reversed() == sample.bytes {
         print("successfully found palindrome on attempt #\(attempt)")
-        return sample
+        return Sample(bytes: sample.bytes, logProb: nil)
       }
       if verbose {
         print("attempt #\(attempt) did not yield palindrome")
@@ -125,15 +138,21 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   @recordCaller
   private func _greedySample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
-  ) async throws -> [UInt8] {
+  ) async throws -> Sample {
     let sampler = Sampler(model: model, prefixes: Tensor(data: [0], shape: [1, 1]))
     let countDist = sampler.predictNextLogits()
-    let charCount =
+    let (charCount, lengthLogProb) =
       if let cc = charCount {
-        cc
+        (cc, Float(0.0))
       } else {
-        try await sampler.sampleTokens(logits: countDist).ints()[0] - 256
+        try await {
+          let sample = sampler.sampleTokens(logits: countDist)
+          let lp = countDist.logSoftmax(axis: -1).gather(axis: 1, indices: sample).flatten()
+          return (try await sample.ints()[0], try await lp.item())
+        }()
       }
+    var logProb = lengthLogProb
+
     if verbose {
       print("character count: \(charCount)")
     }
@@ -141,7 +160,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var result = [UInt8]()
     var endResult = [UInt8]()
     for i in stride(from: 0, to: charCount, by: 2) {
-      let firstSample = sampler.sampleTokens(logits: sampler.predictNextLogits())
+      let logits = sampler.predictNextLogits()
+      let firstSample = sampler.sampleTokens(logits: logits)
+      logProb += try await logits.logSoftmax(axis: -1).gather(axis: 1, indices: firstSample).item()
       sampler.sampled(tokens: firstSample)
       let token = UInt8(try await firstSample.ints()[0])
       result.append(token)
@@ -160,22 +181,28 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         }
       }
     }
-    return result + endResult.reversed()
+    return Sample(bytes: result + endResult.reversed(), logProb: logProb)
   }
 
   @recordCaller
   private func _greedySampleBatch(
     model: Transformer, tokenizer: Tokenizer, batchSize: Int, charCount: Int, verbose: Bool = false
-  ) async throws -> [[UInt8]] {
+  ) async throws -> [Sample] {
     let sampler = Sampler(
-      model: model, prefixes: Tensor(data: [0], shape: [1, 1]).repeating(axis: 0, count: batchSize))
-    try await sampler.predictNextLogits().wait()  // result is ignored
-    sampler.sampled(
-      tokens: Tensor(data: [charCount + 256], shape: [1, 1]).repeating(axis: 0, count: batchSize))
+      model: model,
+      prefixes: Tensor(data: [0, charCount + 256], shape: [1, 2]).repeating(
+        axis: 0, count: batchSize))
+    var logProbs = [Float](repeating: 0.0, count: batchSize)
     var result = [[UInt8]](repeating: [], count: batchSize)
     var endResult = [[UInt8]](repeating: [], count: batchSize)
     for i in stride(from: 0, to: charCount, by: 2) {
-      let firstSample = sampler.sampleTokens(logits: sampler.predictNextLogits())
+      let logits = sampler.predictNextLogits()
+      let firstSample = sampler.sampleTokens(logits: logits)
+      let probs = try await logits.logSoftmax(axis: -1).gather(axis: -1, indices: firstSample)
+        .floats()
+      for (i, x) in probs.enumerated() {
+        logProbs[i] += x
+      }
       sampler.sampled(tokens: firstSample)
       for (j, t) in try await firstSample.ints().enumerated() {
         let token = min(t, 0xff)
@@ -197,14 +224,15 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         sampler.sampled(tokens: firstSample)
       }
     }
-    return zip(result, endResult).map { $0.0 + $0.1.reversed() }
+    let allSamples = zip(result, endResult).map { $0.0 + $0.1.reversed() }
+    return zip(allSamples, logProbs).map { Sample(bytes: $0.0, logProb: $0.1) }
   }
 
   @recordCaller
   private func _bfsSample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
     stochastic: Bool = false
-  ) async throws -> [UInt8] {
+  ) async throws -> Sample {
     func maybeAddNoise(_ x: Tensor) -> Tensor {
       if stochastic {
         x - (-(Tensor(randLike: x).clamp(min: 1e-5, max: 1 - 1e-5).log())).log()
@@ -217,7 +245,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       if let cc = charCount {
         cc
       } else {
-        try await sampleCharCount(model: model, tokenizer: tokenizer)
+        try await sampleCharCount(model: model, tokenizer: tokenizer).0
       }
 
     struct SearchNode {
@@ -228,7 +256,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var nodes = [SearchNode(prefix: [], nll: 0.0)]
     while let nextNode = nodes.popLast() {
       if nextNode.prefix.count == charCount {
-        return tokenizer.inverseAlternating(nextNode.prefix)
+        return Sample(bytes: tokenizer.inverseAlternating(nextNode.prefix), logProb: nil)
       }
 
       print("expanding node of length \(nextNode.prefix.count) with NLL \(nextNode.nll)")
@@ -287,14 +315,18 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       }
       nodes.sort { $0.nll > $1.nll }
     }
-    return []
+    return Sample(bytes: [], logProb: nil)
   }
 
   @recordCaller
-  private func _sampleCharCount(model: Transformer, tokenizer: Tokenizer) async throws -> Int {
-    var iterator = model.sampleStream(prefixes: Tensor(data: [0], shape: [1, 1]))
-      .makeAsyncIterator()
-    return try await iterator.next()!.ints()[0] - 256
+  private func _sampleCharCount(model: Transformer, tokenizer: Tokenizer) async throws -> (
+    Int, Float
+  ) {
+    let iterator = Sampler(
+      model: model, prefixes: Tensor(data: [0], shape: [1, 1])
+    ).iterate(count: 1)
+    let (sample, logProbs) = iterator.next()!
+    return (try await sample.ints()[0] - 256, try await logProbs.item())
   }
 
 }
@@ -343,21 +375,21 @@ public class Sampler {
   }
 
   @recordCaller
-  private func _sampleStream(count: Int? = nil, generator: RandomGenerator? = nil) -> AsyncStream<
-    Tensor
-  > {
-    return AsyncStream { continuation in
-      for _ in 0..<((count ?? model.config.tokenCount) - prefixLength) {
-        if Task.isCancelled {
-          return
-        }
-        let logits = predictNextLogits()
-        let gumbels = -(-Tensor(randLike: logits, generator: generator).log()).log()
-        let samples = (logits + gumbels).argmax(axis: -1).unsqueeze(axis: 1)
-        sampled(tokens: samples)
-        continuation.yield(samples)
-      }
-      continuation.finish()
+  private func _iterate(
+    count: Int? = nil,
+    generator: RandomGenerator? = nil
+  ) -> AnyIterator<(tokens: Tensor, logProbs: Tensor)> {
+    var remaining = (count ?? model.config.tokenCount) - prefixLength
+
+    return AnyIterator { [self] in
+      guard remaining > 0 else { return nil }
+      remaining -= 1
+
+      let logits = predictNextLogits()
+      let samples = logits.softmax(axis: -1).multinomial(sampleCount: 1)
+      let logProbs = logits.logSoftmax(axis: -1).gather(axis: 1, indices: samples)
+      sampled(tokens: samples)
+      return (tokens: samples, logProbs: logProbs)
     }
   }
 }

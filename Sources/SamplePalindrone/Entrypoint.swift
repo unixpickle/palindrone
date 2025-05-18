@@ -44,10 +44,14 @@ import Palindrone
       let sample = try await algorithm.sample(
         model: model, tokenizer: tokenizer, charCount: length, verbose: true)
 
-      if let string = String(bytes: sample, encoding: .utf8) {
+      if let string = String(bytes: sample.bytes, encoding: .utf8) {
         print("Result: \(string)")
       } else {
-        print("Invalid UTF-8 sequence: \(sample)")
+        print("Invalid UTF-8 sequence: \(sample.bytes)")
+      }
+
+      if let lp = sample.logProb {
+        print("(sampled log prob: \(lp))")
       }
 
     } catch { print("FATAL ERROR: \(error)") }
