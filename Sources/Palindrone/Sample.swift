@@ -233,14 +233,6 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
     stochastic: Bool = false
   ) async throws -> Sample {
-    func maybeAddNoise(_ x: Tensor) -> Tensor {
-      if stochastic {
-        x - (-(Tensor(randLike: x).clamp(min: 1e-5, max: 1 - 1e-5).log())).log()
-      } else {
-        x
-      }
-    }
-
     let charCount =
       if let cc = charCount {
         cc
@@ -264,12 +256,10 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       if nextNode.prefix.count % 2 == 1 && nextNode.prefix.count + 1 < charCount {
         // Lookahead to next token without an extra forward pass
         let prev = Int(nextNode.prefix.last!)
-        let allLogits = maybeAddNoise(
-          model(
-            Tensor(
-              data: [0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev],
-              shape: [1, nextNode.prefix.count + 3]
-            )
+        let allLogits = model(
+          Tensor(
+            data: [0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev],
+            shape: [1, nextNode.prefix.count + 3]
           )
         )
         let nextNLL = try await -allLogits[..., -2].logSoftmax().floats()[prev]
@@ -285,12 +275,10 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
           )
         }
       } else {
-        let logits = maybeAddNoise(
-          model(
-            Tensor(
-              data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
-              shape: [1, nextNode.prefix.count + 2]
-            )
+        let logits = model(
+          Tensor(
+            data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
+            shape: [1, nextNode.prefix.count + 2]
           )
         )[..., -1]
         for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
@@ -313,7 +301,14 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
           )
         }
       }
-      nodes.sort { $0.nll > $1.nll }
+      if stochastic {
+        let negGumbel = try await ((-(Tensor(rand: [nodes.count]).clamp(min: 1e-5).log())).log())
+          .floats()
+        let scores: [Float] = zip(nodes, negGumbel).map { $0.0.nll + $0.1 }
+        nodes = zip(scores, nodes).sorted { $0.0 > $1.0 }.map { $0.1 }
+      } else {
+        nodes.sort { $0.nll > $1.nll }
+      }
     }
     return Sample(bytes: [], logProb: nil)
   }
