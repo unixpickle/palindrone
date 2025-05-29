@@ -85,23 +85,12 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         }()
       }
 
-    if verbose {
-      print("character count: \(charCount)")
-    }
     var allChars = [UInt8]()
-    for i in 0..<charCount {
+    for _ in 0..<charCount {
       let (sample, lp) = iterator.next()!
       logProb += try await lp.item()
       let nextToken = try await sample.ints()[0]
-      allChars.append(UInt8(nextToken))
-      if verbose {
-        if let scalar = UnicodeScalar(nextToken), scalar.isASCII {
-          let asciiChar = Character(scalar)
-          print("character \(i): '\(asciiChar)'")
-        } else {
-          print("character \(i): \(nextToken)")
-        }
-      }
+      allChars.append(UInt8(min(0xff, nextToken)))
     }
     return Sample(bytes: tokenizer.inverseAlternating(allChars), logProb: logProb)
   }
@@ -146,7 +135,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         (cc, Float(0.0))
       } else {
         try await {
-          let sample = sampler.sampleTokens(logits: countDist)
+          let sample = sampler.sampleTokens(logits: countDist, mask: 256...)
           let lp = countDist.logSoftmax(axis: -1).gather(axis: 1, indices: sample).flatten()
           return (try await sample.ints()[0], try await lp.item())
         }()
@@ -161,7 +150,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var endResult = [UInt8]()
     for i in stride(from: 0, to: charCount, by: 2) {
       let logits = sampler.predictNextLogits()
-      let firstSample = sampler.sampleTokens(logits: logits)
+      let firstSample = sampler.sampleTokens(logits: logits, mask: ..<256)
       logProb += try await logits.logSoftmax(axis: -1).gather(axis: 1, indices: firstSample).item()
       sampler.sampled(tokens: firstSample)
       let token = UInt8(try await firstSample.ints()[0])
@@ -197,15 +186,14 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var endResult = [[UInt8]](repeating: [], count: batchSize)
     for i in stride(from: 0, to: charCount, by: 2) {
       let logits = sampler.predictNextLogits()
-      let firstSample = sampler.sampleTokens(logits: logits)
+      let firstSample = sampler.sampleTokens(logits: logits, mask: ..<256)
       let probs = try await logits.logSoftmax(axis: -1).gather(axis: -1, indices: firstSample)
         .floats()
       for (i, x) in probs.enumerated() {
         logProbs[i] += x
       }
       sampler.sampled(tokens: firstSample)
-      for (j, t) in try await firstSample.ints().enumerated() {
-        let token = min(t, 0xff)
+      for (j, token) in try await firstSample.ints().enumerated() {
         result[j].append(UInt8(token))
         if i + 1 < charCount {
           endResult[j].append(UInt8(token))
@@ -317,11 +305,13 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   private func _sampleCharCount(model: Transformer, tokenizer: Tokenizer) async throws -> (
     Int, Float
   ) {
-    let iterator = Sampler(
+    let sampler = Sampler(
       model: model, prefixes: Tensor(data: [0], shape: [1, 1])
-    ).iterate(count: 1)
-    let (sample, logProbs) = iterator.next()!
-    return (try await sample.ints()[0] - 256, try await logProbs.item())
+    )
+    let logits = sampler.predictNextLogits()
+    let sample = sampler.sampleTokens(logits: logits, mask: 256...)
+    let logProb = logits.logSoftmax(axis: -1).gather(axis: 1, indices: sample)
+    return (try await sample.ints()[0] - 256, try await logProb.item())
   }
 
 }
@@ -364,7 +354,21 @@ public class Sampler {
   }
 
   @recordCaller
-  private func _sampleTokens(logits: Tensor, generator: RandomGenerator? = nil) -> Tensor {
+  private func _sampleTokens(
+    logits: Tensor, mask: some TensorIndex, generator: RandomGenerator? = nil
+  ) -> Tensor {
+    let useIndices = Tensor(data: 0..<logits.shape.last!)[mask]
+    let logits = logits.gather(axis: 1, indices: useIndices)
+    let indices = logits.softmax(axis: 1).multinomial(sampleCount: 1)
+    return useIndices.unsqueeze(axis: 0).repeating(
+      axis: 0, count: indices.shape[0]
+    ).gather(axis: 1, indices: indices)
+  }
+
+  @recordCaller
+  private func _sampleTokens(
+    logits: Tensor, generator: RandomGenerator? = nil
+  ) -> Tensor {
     let gumbels = -(-Tensor(randLike: logits, generator: generator).log()).log()
     return (logits + gumbels).argmax(axis: -1).unsqueeze(axis: 1)
   }
