@@ -97,7 +97,8 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
 
   @recordCaller
   private func _rejectionSample(
-    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
+    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
+    batchSize: Int = 32
   ) async throws -> Sample {
     let charCount =
       if let cc = charCount {
@@ -106,21 +107,38 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         try await sampleCharCount(model: model, tokenizer: tokenizer).0
       }
 
-    var attempt = 1
+    var attempt = 0
     while true {
       if verbose {
-        print("sampling attempt #\(attempt) ...")
+        print("sampling attempts starting at index #\(attempt*batchSize) ...")
       }
-      let sample = try await randomSample(
-        model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
-      if sample.bytes.reversed() == sample.bytes {
-        print("successfully found palindrome on attempt #\(attempt)")
-        return Sample(bytes: sample.bytes, logProb: nil)
+
+      let sampler = Sampler(
+        model: model,
+        prefixes: Tensor(
+          data: [0, charCount + 256],
+          shape: [1, 2]
+        ).repeating(axis: 0, count: batchSize)
+      )
+      var samples = [[UInt8]](repeating: [], count: batchSize)
+      for (sample, _) in sampler.iterate(count: charCount + 2, mask: ..<256) {
+        for (i, x) in try await sample.ints().enumerated() {
+          samples[i].append(UInt8(x))
+        }
       }
-      if verbose {
-        print("attempt #\(attempt) did not yield palindrome")
+
+      for (i, rawSample) in samples.enumerated() {
+        let sample = tokenizer.inverseAlternating(rawSample)
+        if sample.reversed() == sample {
+          print("successfully found palindrome on attempt #\(attempt*batchSize + i + 1)")
+          return Sample(bytes: sample, logProb: nil)
+        }
       }
+
       attempt += 1
+      if verbose {
+        print("no palindrome after #\(attempt*batchSize) attempts")
+      }
     }
   }
 
@@ -325,7 +343,7 @@ public class Sampler {
 
   public init(model: Transformer, prefixes: Tensor) {
     self.model = model
-    prefixLength = prefixes.shape[0]
+    prefixLength = prefixes.shape[1]
     prevToken = prefixes
     kvCache = KVCache(batchSize: prefixes.shape[0], config: model.config)
   }
@@ -376,16 +394,22 @@ public class Sampler {
   @recordCaller
   private func _iterate(
     count: Int? = nil,
+    mask: (any TensorIndex)? = nil,
     generator: RandomGenerator? = nil
   ) -> AnyIterator<(tokens: Tensor, logProbs: Tensor)> {
     var remaining = (count ?? model.config.tokenCount) - prefixLength
 
-    return AnyIterator { [self] in
+    return AnyIterator { [self] () -> (Tensor, Tensor)? in
       guard remaining > 0 else { return nil }
       remaining -= 1
 
       let logits = predictNextLogits()
-      let samples = logits.softmax(axis: -1).multinomial(sampleCount: 1)
+      let samples =
+        if let mask = mask {
+          sampleTokens(logits: logits, mask: mask, generator: generator)
+        } else {
+          sampleTokens(logits: logits, generator: generator)
+        }
       let logProbs = logits.logSoftmax(axis: -1).gather(axis: 1, indices: samples)
       sampled(tokens: samples)
       return (tokens: samples, logProbs: logProbs)
