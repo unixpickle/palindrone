@@ -12,6 +12,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   case random
   case rejection
   case greedy
+  case greedyPair
   case bfs
   case bfsRandom
 
@@ -28,6 +29,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
     case .greedy:
       try await greedySample(
+        model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
+    case .greedyPair:
+      try await greedyPairSample(
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
     case .bfs:
       try await bfsSample(
@@ -232,6 +236,68 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     }
     let allSamples = zip(result, endResult).map { $0.0 + $0.1.reversed() }
     return zip(allSamples, logProbs).map { Sample(bytes: $0.0, logProb: $0.1) }
+  }
+
+  @recordCaller
+  private func _greedyPairSample(
+    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
+  ) async throws -> Sample {
+    let (charCount, lengthLogProb) =
+      if let cc = charCount {
+        (cc, Float(0.0))
+      } else {
+        try await sampleCharCount(model: model, tokenizer: tokenizer)
+      }
+    var logProb = lengthLogProb
+
+    if verbose {
+      print("character count: \(charCount)")
+    }
+
+    let asciiA = Int("a".first!.asciiValue!)
+    let asciiZ = Int("z".first!.asciiValue!)
+
+    var samplePrefix = [0, charCount]
+    for _ in 0..<(charCount / 2) {
+      let prefixes: [[Int]] = (asciiA...asciiZ).map { samplePrefix + [$0] }
+      let seq = Tensor(
+        data: prefixes.flatMap { $0 },
+        shape: [prefixes.count, samplePrefix.count + 1]
+      )
+      let logits = Tensor.withGrad(enabled: false) {
+        model(seq)[..., (-2)...]
+      }
+
+      // Get probability of producing each last token twice.
+      let logProbs = logits.logSoftmax(axis: -1).gather(
+        axis: 2, indices: seq[..., -1].reshape([seq.shape[0], 1, 1])
+      ).reshape([seq.shape[0], 2]).sum(axis: 1).logSoftmax(axis: 0)
+
+      let sample =
+        try await logProbs.exp().multinomial(sampleCount: 1).ints()[0]
+      logProb +=
+        try await logProbs[sample].item()
+      samplePrefix.append(sample + asciiA)
+      samplePrefix.append(sample + asciiA)
+    }
+
+    print("samplePrefix", samplePrefix)
+
+    if charCount % 2 == 1 {
+      let seq = Tensor(
+        data: samplePrefix,
+        shape: [1, samplePrefix.count]
+      )
+      let logProbs = Tensor.withGrad(enabled: false) {
+        model(seq)[..., ..., ..<256]
+      }[0, -1].logSoftmax(axis: 0)
+      let sample = try await logProbs.exp().multinomial(sampleCount: 1).ints()[0]
+      samplePrefix.append(sample)
+      logProb += try await logProbs[sample].item()
+    }
+
+    return Sample(
+      bytes: tokenizer.inverseAlternating(samplePrefix[2...].map { UInt8($0) }), logProb: logProb)
   }
 
   @recordCaller
