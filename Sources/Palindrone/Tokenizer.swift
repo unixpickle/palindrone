@@ -1,7 +1,7 @@
 import HCBacktrace
 import Honeycrisp
 
-public class Tokenizer {
+final public class Tokenizer: Sendable {
   public let maxBytes: Int
 
   public var inputCount: Int {

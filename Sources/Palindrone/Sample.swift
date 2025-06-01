@@ -7,6 +7,9 @@ public struct Sample {
   public let logProb: Float?
 }
 
+internal let ASCII_A = Int("a".first!.asciiValue!)
+internal let ASCII_Z = Int("z".first!.asciiValue!)
+
 public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable {
 
   case random
@@ -254,12 +257,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       print("character count: \(charCount)")
     }
 
-    let asciiA = Int("a".first!.asciiValue!)
-    let asciiZ = Int("z".first!.asciiValue!)
-
     var samplePrefix = [0, charCount]
     for _ in 0..<(charCount / 2) {
-      let prefixes: [[Int]] = (asciiA...asciiZ).map { samplePrefix + [$0] }
+      let prefixes: [[Int]] = (ASCII_A...ASCII_Z).map { samplePrefix + [$0] }
       let seq = Tensor(
         data: prefixes.flatMap { $0 },
         shape: [prefixes.count, samplePrefix.count + 1]
@@ -277,11 +277,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         try await logProbs.exp().multinomial(sampleCount: 1).ints()[0]
       logProb +=
         try await logProbs[sample].item()
-      samplePrefix.append(sample + asciiA)
-      samplePrefix.append(sample + asciiA)
+      samplePrefix.append(sample + ASCII_A)
+      samplePrefix.append(sample + ASCII_A)
     }
-
-    print("samplePrefix", samplePrefix)
 
     if charCount % 2 == 1 {
       let seq = Tensor(
@@ -297,7 +295,9 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     }
 
     return Sample(
-      bytes: tokenizer.inverseAlternating(samplePrefix[2...].map { UInt8($0) }), logProb: logProb)
+      bytes: tokenizer.inverseAlternating(samplePrefix[2...].map { UInt8($0) }),
+      logProb: logProb
+    )
   }
 
   @recordCaller
@@ -305,12 +305,39 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
     stochastic: Bool = false
   ) async throws -> Sample {
+    var result: [UInt8]? = nil
+    try await bfsSampleMany(
+      model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose,
+      stochastic: stochastic
+    ) { x in
+      result = x
+      return false
+    }
+    if let result = result {
+      return Sample(bytes: result, logProb: nil)
+    } else {
+      return Sample(bytes: [], logProb: nil)
+    }
+  }
+
+  @recordCaller
+  private func _bfsSampleMany(
+    model: Transformer,
+    tokenizer: Tokenizer,
+    charCount: Int? = nil,
+    verbose: Bool = false,
+    stochastic: Bool = false,
+    cb: ([UInt8]) async throws -> Bool
+  ) async throws {
     let charCount =
       if let cc = charCount {
         cc
       } else {
         try await sampleCharCount(model: model, tokenizer: tokenizer).0
       }
+    if verbose {
+      print("character count: \(charCount)")
+    }
 
     struct SearchNode {
       let prefix: [UInt8]
@@ -320,10 +347,15 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var nodes = [SearchNode(prefix: [], nll: 0.0)]
     while let nextNode = nodes.popLast() {
       if nextNode.prefix.count == charCount {
-        return Sample(bytes: tokenizer.inverseAlternating(nextNode.prefix), logProb: nil)
+        if !(try await cb(tokenizer.inverseAlternating(nextNode.prefix))) {
+          return
+        }
+        continue
       }
 
-      print("expanding node of length \(nextNode.prefix.count) with NLL \(nextNode.nll)")
+      if verbose {
+        print("expanding node of length \(nextNode.prefix.count) with NLL \(nextNode.nll)")
+      }
 
       if nextNode.prefix.count % 2 == 1 && nextNode.prefix.count + 1 < charCount {
         // Lookahead to next token without an extra forward pass
@@ -354,7 +386,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
           )
         )[..., -1]
         for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
-          if i >= 0x80 {
+          if i < ASCII_A || i > ASCII_Z {
             continue
           }
 
@@ -382,7 +414,6 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         nodes.sort { $0.nll > $1.nll }
       }
     }
-    return Sample(bytes: [], logProb: nil)
   }
 
   @recordCaller
