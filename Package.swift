@@ -50,5 +50,12 @@ let package = Package(
         .product(name: "Honeycrisp", package: "honeycrisp"),
       ]
     ),
+    .executableTarget(
+      name: "TextLikelihood",
+      dependencies: [
+        "Palindrone", .product(name: "ArgumentParser", package: "swift-argument-parser"),
+        .product(name: "Honeycrisp", package: "honeycrisp"),
+      ]
+    ),
   ]
 )
