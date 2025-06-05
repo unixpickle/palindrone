@@ -21,6 +21,7 @@ import Palindrone
   @Option(name: .long, help: "Divide batches into microbatches.") var microbatch: Int? = nil
   @Option(name: .long, help: "Minimum length of context.") var minChunkLength: Int = 8
   @Option(name: .long, help: "Maximum length of context.") var maxChunkLength: Int = 63
+  @Option(name: .long, help: "Dataset shuffle buffer size.") var bufferSize: Int = 16_777_216
 
   // Model hyperparameters
   @Option(name: .long, help: "Transformer layers.") var depth: Int = 12
@@ -46,13 +47,7 @@ import Palindrone
     do {
       Backend.defaultBackend = try MPSBackend(allocator: .bucket)
 
-      print("creating dataset...")
-      let dataset = try Dataset(
-        directory: datasetDir,
-        minChunkLength: minChunkLength,
-        maxChunkLength: maxChunkLength
-      )
-
+      let dataset: Dataset
       var model: Transformer
       var opt: Adam
       let clipper = GradClipper()
@@ -74,8 +69,16 @@ import Palindrone
         if let optState = state.opt { try opt.loadState(optState) }
 
         if let clipperState = state.clipper { clipper.state = clipperState }
-        if let dataState = state.data { dataset.state = dataState }
         step = state.step ?? 0
+
+        print("creating dataset...")
+        dataset = try Dataset(
+          directory: datasetDir,
+          minChunkLength: minChunkLength,
+          maxChunkLength: maxChunkLength,
+          bufferSize: bufferSize,
+          state: state.data
+        )
       } else {
         print("creating model...")
         model = Transformer(
@@ -90,6 +93,14 @@ import Palindrone
 
         print("creating optimizer...")
         opt = Adam(model.parameters, lr: lr)
+
+        print("creating dataset...")
+        dataset = try Dataset(
+          directory: datasetDir,
+          minChunkLength: minChunkLength,
+          maxChunkLength: maxChunkLength,
+          bufferSize: bufferSize
+        )
       }
 
       while true {
@@ -125,7 +136,7 @@ import Palindrone
             step: step,
             opt: try await opt.state(),
             clipper: clipper.state,
-            data: dataset.state
+            data: try await dataset.state()
           )
           let stateData = try PropertyListEncoder().encode(state)
           try stateData.write(to: URL(filePath: savePath), options: .atomic)

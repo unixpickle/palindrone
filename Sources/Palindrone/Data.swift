@@ -1,45 +1,59 @@
 import Foundation
+import HCBacktrace
 import Honeycrisp
 
 public class Dataset {
 
   public struct State: Codable {
-    public let currentEpoch: Int
-    public let currentDocOffset: Int
+    public let buffer: [[UInt8]]
+    public let rngState: TensorState
+    public let nextFile: Int
   }
 
   public enum DatasetError: Error {
     case couldNotEnumerate
-    case datasetIsEmpty
+    case reachedEndOfData
   }
 
   public let directory: String
   public let minChunkLength: Int
   public let maxChunkLength: Int
   public let textFilenames: [String]
+  private let bufferSize: Int
+  private let rng: RandomGenerator
 
-  private var currentEpoch: Int = 0
-  private var currentDocOffset: Int = 0
-  private var allWords: [[UInt8]]? = nil
-  private var docsInEpoch: [[UInt8]]? = nil
+  private var nextFile: Int = 0
+  private var buffer: [[UInt8]] = []
+  private var currentBufferSize: Int = 0
 
-  public var state: State {
-    get {
-      State(
-        currentEpoch: currentEpoch, currentDocOffset: currentDocOffset
-      )
-    }
-    set {
-      currentEpoch = newValue.currentEpoch
-      currentDocOffset = newValue.currentDocOffset
-      docsInEpoch = nil
-    }
+  @recordCaller
+  private func _state() async throws -> State {
+    return State(
+      buffer: buffer,
+      rngState: try await rng.state.state(),
+      nextFile: nextFile
+    )
   }
 
-  public init(directory: String, minChunkLength: Int, maxChunkLength: Int) throws {
+  public init(
+    directory: String,
+    minChunkLength: Int,
+    maxChunkLength: Int,
+    bufferSize: Int,
+    state: State? = nil
+  ) throws {
     self.directory = directory
     self.minChunkLength = minChunkLength
     self.maxChunkLength = maxChunkLength
+    self.bufferSize = bufferSize
+    self.rng = Backend.current.createRandom()
+    if let state = state {
+      self.nextFile = state.nextFile
+      self.buffer = state.buffer
+      self.rng.state = Tensor(state: state.rngState)
+    } else {
+      self.rng.seed(0)
+    }
 
     let fileManager = FileManager.default
     let baseURL = URL(filePath: directory).absoluteURL
@@ -53,40 +67,52 @@ public class Dataset {
       throw DatasetError.couldNotEnumerate
     }
 
+    print("listing files in \(directory) ...")
     textFilenames =
       enumerator
       .compactMap { $0 as? URL }
       .filter { $0.pathExtension.lowercased() == "txt" }
       .map { $0.path.replacingOccurrences(of: baseURL.path + "/", with: "") }
       .sorted()
+    print("listed \(textFilenames.count) dataset files")
   }
 
   public func next() async throws -> [UInt8] {
-    let allDocs = try await epochDocs()
-    if currentDocOffset >= allDocs.count {
-      if currentDocOffset == 0 {
-        throw DatasetError.datasetIsEmpty
+    if currentBufferSize == 0 {
+      print("filling dataset buffer from scratch...")
+      while currentBufferSize < bufferSize {
+        try await readNextFile()
       }
-      currentEpoch += 1
-      currentDocOffset = 0
-      docsInEpoch = nil
-      return try await next()
+      print("loaded \(currentBufferSize) bytes into dataset buffer")
     }
-
-    currentDocOffset += 1
-    return allDocs[currentDocOffset - 1]
+    let idx = try await Tensor(randInt: [1], in: 0..<Int64(buffer.count), generator: rng)
+      .item(Int.self)
+    let result = buffer.remove(at: idx)
+    currentBufferSize -= result.count
+    return result
   }
 
-  private func epochDocs() async throws -> [[UInt8]] {
-    if let docs = docsInEpoch {
-      return docs
+  @recordCaller
+  internal func _readNextFile() async throws {
+    if nextFile >= textFilenames.count {
+      throw DatasetError.reachedEndOfData
     }
+    let fileURL = URL(filePath: directory).appending(path: textFilenames[nextFile])
+    nextFile += 1
+    let paragraphs = try loadParagraphWords(fileURL)
+    let seqs = try await paragraphsToSequences(
+      paragraphs, rng: rng, minChunkLength: minChunkLength, maxChunkLength: maxChunkLength)
+    buffer.append(contentsOf: seqs)
+    currentBufferSize += seqs.reduce(0, { $0 + $1.count })
+  }
 
-    let words = try loadWords()
+}
 
-    let rng = Backend.current.createRandom()
-    rng.seed(currentEpoch)
-
+private func paragraphsToSequences(
+  _ paragraphs: [[[UInt8]]], rng: RandomGenerator, minChunkLength: Int, maxChunkLength: Int
+) async throws -> [[UInt8]] {
+  var chunks = [[UInt8]]()
+  for words in paragraphs {
     let lengths = try await Tensor(
       randInt: [words.count],
       in: Int64(minChunkLength)..<(Int64(maxChunkLength) + 1),
@@ -106,7 +132,6 @@ public class Dataset {
       wordOffset -= 1
     }
 
-    var chunks = [[UInt8]]()
     for length in lengths {
       var chunk = [[UInt8]]()
       var chunkSize = 0
@@ -129,40 +154,31 @@ public class Dataset {
         break
       }
     }
-
-    // Global shuffle of documents
-    let indices = try await Tensor(
-      randPerm: [chunks.count],
-      generator: rng
-    ).ints()
-    docsInEpoch = indices.map { chunks[$0] }
-
-    return docsInEpoch!
   }
+  return chunks
+}
 
-  private func loadWords() throws -> [[UInt8]] {
-    if let result = allWords {
+private func loadParagraphWords(_ url: URL) throws -> [[[UInt8]]] {
+  let allText = try String(contentsOf: url, encoding: .utf8)
+  return allText.lowercased().components(separatedBy: .newlines).compactMap {
+    paragraph -> [[UInt8]]? in
+    let result = paragraph.components(separatedBy: .whitespaces).compactMap { word -> [UInt8]? in
+      let result = word.compactMap { char -> UInt8? in
+        guard let ascii = char.asciiValue, ascii >= 97 && ascii <= 122 else {
+          return nil
+        }
+        return ascii
+      }
+      if result.isEmpty {
+        return nil
+      } else {
+        return result
+      }
+    }
+    if result.isEmpty {
+      return nil
+    } else {
       return result
     }
-    let fileURL = URL(filePath: directory).absoluteURL
-    let allURLs = textFilenames.map { fileURL.appending(path: $0) }
-    allWords = allURLs.map { url in
-      (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-    }.joined(separator: "\n").lowercased().components(separatedBy: .whitespacesAndNewlines)
-      .compactMap { word in
-        let result = word.compactMap { char -> UInt8? in
-          guard let ascii = char.asciiValue, ascii >= 97 && ascii <= 122 else {
-            return nil
-          }
-          return ascii
-        }
-        if result.isEmpty {
-          return nil
-        } else {
-          return result
-        }
-      }
-    return allWords!
   }
-
 }
