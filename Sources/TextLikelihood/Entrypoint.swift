@@ -42,8 +42,8 @@ import Palindrone
       print("building sequence")
       let textBytes = [UInt8](text.utf8)
       let seq = Tensor(
-        data: [0, 256 + textBytes.count] + tokenizer.alternatingStartEnd(textBytes).map(Int.init)
-      ).unsqueeze(axis: 0)
+        data: [[0, 256 + textBytes.count] + tokenizer.alternatingStartEnd(textBytes).map(Int.init)]
+      )
       let output = Tensor.withGrad(enabled: false) {
         let logits = model(seq)
         return logits[..., 1..<(textBytes.count + 1)].logSoftmax(axis: -1).gather(

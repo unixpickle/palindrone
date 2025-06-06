@@ -80,10 +80,9 @@ public class Dataset {
   public func next() async throws -> [UInt8] {
     if currentBufferSize == 0 {
       print("filling dataset buffer from scratch...")
-      while currentBufferSize < bufferSize {
-        try await readNextFile()
-      }
-      print("loaded \(currentBufferSize) bytes into dataset buffer")
+    }
+    while currentBufferSize < bufferSize {
+      try await readNextFile()
     }
     let idx = try await Tensor(randInt: [1], in: 0..<Int64(buffer.count), generator: rng)
       .item(Int.self)

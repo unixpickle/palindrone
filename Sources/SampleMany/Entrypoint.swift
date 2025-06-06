@@ -50,10 +50,10 @@ import Palindrone
           model: model, tokenizer: tokenizer, batchSize: batchSize, charCount: length
         )
         let inputSeqs = Tensor(
-          data: batch.flatMap {
+          data: batch.map {
             [0, length + 256] + tokenizer.alternatingStartEnd($0.bytes).map(Int.init)
-          },
-          shape: [batchSize, length + 2])
+          }
+        )
         let preds = Tensor.withGrad(enabled: false) {
           model(inputSeqs)[..., 1..<(inputSeqs.shape[1] - 1)]
         }

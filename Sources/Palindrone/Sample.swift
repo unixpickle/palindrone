@@ -78,7 +78,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         [0]
       }
     let iterator = Sampler(
-      model: model, prefixes: Tensor(data: initialData, shape: [1, initialData.count])
+      model: model, prefixes: Tensor(data: [initialData])
     ).iterate()
 
     let charCount =
@@ -88,7 +88,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         try await {
           let (output, lp) = iterator.next()!
           logProb += try await lp.item()
-          return try await output.ints()[0] - 256
+          return try await output.item(Int.self) - 256
         }()
       }
 
@@ -96,7 +96,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     for _ in 0..<charCount {
       let (sample, lp) = iterator.next()!
       logProb += try await lp.item()
-      let nextToken = try await sample.ints()[0]
+      let nextToken = try await sample.item(Int.self)
       allChars.append(UInt8(min(0xff, nextToken)))
     }
     return Sample(bytes: tokenizer.inverseAlternating(allChars), logProb: logProb)
@@ -122,10 +122,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
 
       let sampler = Sampler(
         model: model,
-        prefixes: Tensor(
-          data: [0, charCount + 256],
-          shape: [1, 2]
-        ).repeating(axis: 0, count: batchSize)
+        prefixes: Tensor(data: [[0, charCount + 256]]).repeating(axis: 0, count: batchSize)
       )
       var samples = [[UInt8]](repeating: [], count: batchSize)
       for (sample, _) in sampler.iterate(count: charCount + 2, mask: ..<256) {
@@ -153,7 +150,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   private func _greedySample(
     model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
   ) async throws -> Sample {
-    let sampler = Sampler(model: model, prefixes: Tensor(data: [0], shape: [1, 1]))
+    let sampler = Sampler(model: model, prefixes: Tensor(data: [[0]]))
     let countDist = sampler.predictNextLogits()
     let (charCount, lengthLogProb) =
       if let cc = charCount {
@@ -162,7 +159,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         try await {
           let sample = sampler.sampleTokens(logits: countDist, mask: 256...)
           let lp = countDist.logSoftmax(axis: -1).gather(axis: 1, indices: sample).flatten()
-          return (try await sample.ints()[0], try await lp.item())
+          return (try await sample.item(Int.self) - 256, try await lp.item())
         }()
       }
     var logProb = lengthLogProb
@@ -170,7 +167,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     if verbose {
       print("character count: \(charCount)")
     }
-    sampler.sampled(tokens: Tensor(data: [charCount + 256], shape: [1, 1]))
+    sampler.sampled(tokens: Tensor(data: [[charCount + 256]]))
     var result = [UInt8]()
     var endResult = [UInt8]()
     for i in stride(from: 0, to: charCount, by: 2) {
@@ -178,7 +175,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       let firstSample = sampler.sampleTokens(logits: logits, mask: ..<256)
       logProb += try await logits.logSoftmax(axis: -1).gather(axis: 1, indices: firstSample).item()
       sampler.sampled(tokens: firstSample)
-      let token = UInt8(try await firstSample.ints()[0])
+      let token = UInt8(try await firstSample.item(Int.self))
       result.append(token)
       if i + 1 < charCount {
         endResult.append(token)
@@ -204,8 +201,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   ) async throws -> [Sample] {
     let sampler = Sampler(
       model: model,
-      prefixes: Tensor(data: [0, charCount + 256], shape: [1, 2]).repeating(
-        axis: 0, count: batchSize))
+      prefixes: Tensor(data: [[0, charCount + 256]]).repeating(axis: 0, count: batchSize))
     var logProbs = [Float](repeating: 0.0, count: batchSize)
     var result = [[UInt8]](repeating: [], count: batchSize)
     var endResult = [[UInt8]](repeating: [], count: batchSize)
@@ -260,10 +256,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     var samplePrefix = [0, charCount]
     for _ in 0..<(charCount / 2) {
       let prefixes: [[Int]] = (ASCII_A...ASCII_Z).map { samplePrefix + [$0] }
-      let seq = Tensor(
-        data: prefixes.flatMap { $0 },
-        shape: [prefixes.count, samplePrefix.count + 1]
-      )
+      let seq = Tensor(data: prefixes)
       let logits = Tensor.withGrad(enabled: false) {
         model(seq)[..., (-2)...]
       }
@@ -274,7 +267,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       ).reshape([seq.shape[0], 2]).sum(axis: 1).logSoftmax(axis: 0)
 
       let sample =
-        try await logProbs.exp().multinomial(sampleCount: 1).ints()[0]
+        try await logProbs.exp().multinomial(sampleCount: 1).item(Int.self)
       logProb +=
         try await logProbs[sample].item()
       samplePrefix.append(sample + ASCII_A)
@@ -282,14 +275,11 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     }
 
     if charCount % 2 == 1 {
-      let seq = Tensor(
-        data: samplePrefix,
-        shape: [1, samplePrefix.count]
-      )
+      let seq = Tensor(data: [samplePrefix])
       let logProbs = Tensor.withGrad(enabled: false) {
         model(seq)[..., ..., ..<256]
       }[0, -1].logSoftmax(axis: 0)
-      let sample = try await logProbs.exp().multinomial(sampleCount: 1).ints()[0]
+      let sample = try await logProbs.exp().multinomial(sampleCount: 1).item(Int.self)
       samplePrefix.append(sample)
       logProb += try await logProbs[sample].item()
     }
@@ -361,14 +351,11 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         // Lookahead to next token without an extra forward pass
         let prev = Int(nextNode.prefix.last!)
         let allLogits = model(
-          Tensor(
-            data: [0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev],
-            shape: [1, nextNode.prefix.count + 3]
-          )
+          Tensor(data: [[0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev]])
         )
         let nextNLL = try await -allLogits[..., -2].logSoftmax().floats()[prev]
         for (i, logProb) in try await allLogits[..., -1].logSoftmax().floats().enumerated() {
-          if i >= 0x80 {
+          if i < ASCII_A || i > ASCII_Z {
             continue
           }
           nodes.append(
@@ -380,10 +367,7 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
         }
       } else {
         let logits = model(
-          Tensor(
-            data: [0, charCount + 256] + nextNode.prefix.map(Int.init),
-            shape: [1, nextNode.prefix.count + 2]
-          )
+          Tensor(data: [[0, charCount + 256] + nextNode.prefix.map(Int.init)])
         )[..., -1]
         for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
           if i < ASCII_A || i > ASCII_Z {
@@ -421,12 +405,12 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     Int, Float
   ) {
     let sampler = Sampler(
-      model: model, prefixes: Tensor(data: [0], shape: [1, 1])
+      model: model, prefixes: Tensor(data: [[0]])
     )
     let logits = sampler.predictNextLogits()
     let sample = sampler.sampleTokens(logits: logits, mask: 256...)
     let logProb = logits.logSoftmax(axis: -1).gather(axis: 1, indices: sample)
-    return (try await sample.ints()[0] - 256, try await logProb.item())
+    return (try await sample.item(Int.self) - 256, try await logProb.item())
   }
 
 }
@@ -484,8 +468,7 @@ public class Sampler {
   private func _sampleTokens(
     logits: Tensor, generator: RandomGenerator? = nil
   ) -> Tensor {
-    let gumbels = -(-Tensor(randLike: logits, generator: generator).log()).log()
-    return (logits + gumbels).argmax(axis: -1).unsqueeze(axis: 1)
+    logits.softmax(axis: -1).multinomial(sampleCount: 1)
   }
 
   @recordCaller

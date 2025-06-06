@@ -21,7 +21,7 @@ import Palindrone
   @Option(name: .long, help: "Divide batches into microbatches.") var microbatch: Int? = nil
   @Option(name: .long, help: "Minimum length of context.") var minChunkLength: Int = 8
   @Option(name: .long, help: "Maximum length of context.") var maxChunkLength: Int = 63
-  @Option(name: .long, help: "Dataset shuffle buffer size.") var bufferSize: Int = 16_777_216
+  @Option(name: .long, help: "Dataset shuffle buffer size.") var bufferSize: Int = 16_777_216*8
 
   // Model hyperparameters
   @Option(name: .long, help: "Transformer layers.") var depth: Int = 12
