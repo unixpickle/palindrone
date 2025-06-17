@@ -51,6 +51,7 @@ public class Dataset {
       self.nextFile = state.nextFile
       self.buffer = state.buffer
       self.rng.state = Tensor(state: state.rngState)
+      currentBufferSize = self.buffer.map { $0.count }.reduce(0, +)
     } else {
       self.rng.seed(0)
     }
