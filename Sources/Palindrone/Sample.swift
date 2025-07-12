@@ -17,7 +17,6 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
   case greedy
   case greedyPair
   case bfs
-  case bfsRandom
 
   @recordCaller
   private func _sample(
@@ -39,10 +38,6 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     case .bfs:
       try await bfsSample(
         model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose)
-    case .bfsRandom:
-      try await bfsSample(
-        model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose, stochastic: true
-      )
     }
   }
 
@@ -292,13 +287,11 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
 
   @recordCaller
   private func _bfsSample(
-    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false,
-    stochastic: Bool = false
+    model: Transformer, tokenizer: Tokenizer, charCount: Int? = nil, verbose: Bool = false
   ) async throws -> Sample {
     var result: [UInt8]? = nil
     try await bfsSampleMany(
-      model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose,
-      stochastic: stochastic
+      model: model, tokenizer: tokenizer, charCount: charCount, verbose: verbose
     ) { x in
       result = x
       return false
@@ -316,7 +309,6 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
     tokenizer: Tokenizer,
     charCount: Int? = nil,
     verbose: Bool = false,
-    stochastic: Bool = false,
     cb: ([UInt8]) async throws -> Bool
   ) async throws {
     let charCount =
@@ -329,45 +321,41 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
       print("character count: \(charCount)")
     }
 
-    struct SearchNode {
-      let prefix: [UInt8]
-      let nll: Float
-    }
+    var nodes = PriorityQueue<[UInt8], Float>()
+    nodes.push([], priority: 0.0)
 
-    var nodes = [SearchNode(prefix: [], nll: 0.0)]
-    while let nextNode = nodes.popLast() {
-      if nextNode.prefix.count == charCount {
-        if !(try await cb(tokenizer.inverseAlternating(nextNode.prefix))) {
+    while let (nextPrefix, nextLL) = nodes.pop() {
+      let nextNLL = -nextLL
+      if nextPrefix.count == charCount {
+        if !(try await cb(tokenizer.inverseAlternating(nextPrefix))) {
           return
         }
         continue
       }
 
       if verbose {
-        print("expanding node of length \(nextNode.prefix.count) with NLL \(nextNode.nll)")
+        print("expanding node of length \(nextPrefix.count) with NLL \(nextNLL)")
       }
 
-      if nextNode.prefix.count % 2 == 1 && nextNode.prefix.count + 1 < charCount {
+      if nextPrefix.count % 2 == 1 && nextPrefix.count + 1 < charCount {
         // Lookahead to next token without an extra forward pass
-        let prev = Int(nextNode.prefix.last!)
+        let prev = Int(nextPrefix.last!)
         let allLogits = model(
-          Tensor(data: [[0, charCount + 256] + nextNode.prefix.map(Int.init) + [prev]])
+          Tensor(data: [[0, charCount + 256] + nextPrefix.map(Int.init) + [prev]])
         )
-        let nextNLL = try await -allLogits[..., -2].logSoftmax().floats()[prev]
+        let addNLL = try await -allLogits[..., -2].logSoftmax().floats()[prev]
         for (i, logProb) in try await allLogits[..., -1].logSoftmax().floats().enumerated() {
           if i < ASCII_A || i > ASCII_Z {
             continue
           }
-          nodes.append(
-            SearchNode(
-              prefix: nextNode.prefix + [UInt8(prev), UInt8(i)],
-              nll: nextNode.nll + nextNLL - logProb
-            )
+          nodes.push(
+            nextPrefix + [UInt8(prev), UInt8(i)],
+            priority: -(nextNLL + addNLL - logProb)
           )
         }
       } else {
         let logits = model(
-          Tensor(data: [[0, charCount + 256] + nextNode.prefix.map(Int.init)])
+          Tensor(data: [[0, charCount + 256] + nextPrefix.map(Int.init)])
         )[..., -1]
         for (i, logProb) in try await logits.logSoftmax().floats().enumerated() {
           if i < ASCII_A || i > ASCII_Z {
@@ -375,27 +363,17 @@ public enum SampleMethod: String, ExpressibleByArgument, CaseIterable, Sendable 
           }
 
           // Enforce palindrome constraint.
-          if nextNode.prefix.count % 2 == 1 {
-            if i != Int(nextNode.prefix.last!) {
+          if nextPrefix.count % 2 == 1 {
+            if i != Int(nextPrefix.last!) {
               continue
             }
           }
 
-          nodes.append(
-            SearchNode(
-              prefix: nextNode.prefix + [UInt8(i)],
-              nll: nextNode.nll - logProb
-            )
+          nodes.push(
+            nextPrefix + [UInt8(i)],
+            priority: -(nextNLL - logProb)
           )
         }
-      }
-      if stochastic {
-        let negGumbel = try await ((-(Tensor(rand: [nodes.count]).clamp(min: 1e-5).log())).log())
-          .floats()
-        let scores: [Float] = zip(nodes, negGumbel).map { $0.0.nll + $0.1 }
-        nodes = zip(scores, nodes).sorted { $0.0 > $1.0 }.map { $0.1 }
-      } else {
-        nodes.sort { $0.nll > $1.nll }
       }
     }
   }
